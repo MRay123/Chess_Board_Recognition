@@ -158,6 +158,100 @@ def warp_board(img, corners, out_size=800):
     return warped
 
 
+# ============================================================
+# Improved grid detection using Hough-lines on warped board
+# ============================================================
+
+def merge_close_lines(lines, thresh=8):
+    """Merge detected lines that are close together."""
+    if not lines:
+        return []
+    lines = sorted(lines)
+    merged = [lines[0]]
+    for x in lines[1:]:
+        if abs(x - merged[-1]) > thresh:
+            merged.append(x)
+    return merged
+
+
+def force_exact_lines(lines, expected, max_val):
+    """
+    If Hough gives too many/few lines, cluster or pad until exactly `expected` lines.
+    """
+    if len(lines) == 0:
+        # fallback: evenly spaced
+        return [int(i * max_val / (expected - 1)) for i in range(expected)]
+
+    Z = np.array(lines, dtype=np.float32).reshape(-1, 1)
+
+    # If too few lines, pad with uniform guesses.
+    if len(Z) < expected:
+        pad = np.linspace(0, max_val, expected).reshape(-1, 1)
+        Z = np.vstack([Z, pad])
+
+    # K-means cluster to exactly N lines
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1.0)
+    _, _, centers = cv2.kmeans(Z, expected, None, criteria, 15, cv2.KMEANS_PP_CENTERS)
+
+    centers = sorted(int(c[0]) for c in centers)
+    return centers
+
+
+def detect_grid_lines(warped):
+    """
+    Detects 9 vertical + 9 horizontal chessboard grid lines from the
+    top-down warped board using HoughLinesP.
+    """
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    edges = cv2.Canny(gray, 40, 170)
+
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi/180,
+        threshold=80,
+        minLineLength=warped.shape[1] // 5,
+        maxLineGap=8
+    )
+
+    if lines is None:
+        return None, None
+
+    vertical = []
+    horizontal = []
+
+    for (x1, y1, x2, y2) in lines[:, 0]:
+        if abs(x1 - x2) < 10:      # vertical-ish
+            vertical.append(int((x1 + x2) // 2))
+        elif abs(y1 - y2) < 10:    # horizontal-ish
+            horizontal.append(int((y1 + y2) // 2))
+
+    vertical = merge_close_lines(vertical)
+    horizontal = merge_close_lines(horizontal)
+
+    # Force exactly 9 boundaries (8 squares = 9 grid lines)
+    vertical = force_exact_lines(vertical, expected=9, max_val=warped.shape[1])
+    horizontal = force_exact_lines(horizontal, expected=9, max_val=warped.shape[0])
+
+    return vertical, horizontal
+
+
+def draw_grid_lines(warped, vertical, horizontal):
+    """Returns a debug image with grid lines drawn."""
+    dbg = warped.copy()
+    H, W = warped.shape[:2]
+
+    for x in vertical:
+        cv2.line(dbg, (x, 0), (x, H), (0, 0, 255), 2)
+
+    for y in horizontal:
+        cv2.line(dbg, (0, y), (W, y), (0, 255, 0), 2)
+
+    return dbg
+
+
 # ------------------------------------------------------------
 # Extract 64 squares
 # ------------------------------------------------------------
