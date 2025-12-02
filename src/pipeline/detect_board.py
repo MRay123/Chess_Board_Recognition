@@ -16,6 +16,37 @@ def order_corners(pts):
     return np.array([tl, tr, br, bl], dtype="float32")
 
 
+
+def refine_corners_to_edges(img, corners, search=15):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+
+    refined = []
+    H, W = edges.shape
+
+    for (x, y) in corners.astype(int):
+        x1 = max(0, x - search)
+        x2 = min(W, x + search)
+        y1 = max(0, y - search)
+        y2 = min(H, y + search)
+
+        patch = edges[y1:y2, x1:x2]
+
+        if patch.sum() == 0:
+            refined.append([x, y])
+            continue
+
+        ys, xs = np.where(patch > 0)
+
+        xs = xs + x1
+        ys = ys + y1
+
+        refined.append([np.mean(xs), np.mean(ys)])
+
+    return np.array(refined, dtype=np.float32)
+
+
+
 # ------------------------------------------------------------
 # Hough-line-based board detector
 # ------------------------------------------------------------
@@ -127,19 +158,26 @@ def detect_board_corners(img):
     # 1) Try line-based
     c1 = detect_using_lines(gray)
     if c1 is not None:
-        return order_corners(c1)
+        ordered = order_corners(c1)
+        refined = refine_corners_to_edges(img, ordered)
+        return refined
 
     # 2) Try contour-based
     c2 = detect_using_contours(gray)
     if c2 is not None:
-        return order_corners(c2)
+        ordered = order_corners(c2)
+        refined = refine_corners_to_edges(img, ordered)
+        return refined
 
     # 3) Fallback: findChessboardCornersSB
     c3 = detect_using_chessboard(gray)
     if c3 is not None:
-        return order_corners(c3)
+        ordered = order_corners(c3)
+        refined = refine_corners_to_edges(img, ordered)
+        return refined
 
-    return None  # nothing found
+    return None
+
 
 
 # ------------------------------------------------------------
@@ -197,45 +235,46 @@ def force_exact_lines(lines, expected, max_val):
     return centers
 
 
-def detect_grid_lines(warped):
-    """
-    Detects 9 vertical + 9 horizontal chessboard grid lines from the
-    top-down warped board using HoughLinesP.
-    """
+def detect_grid_by_projection(warped):
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    edges = cv2.Canny(gray, 40, 170)
+    proj_x = np.sum(gray, axis=0)     # sum over rows → vertical grid lines
+    proj_y = np.sum(gray, axis=1)     # sum over columns → horizontal grid lines
 
-    lines = cv2.HoughLinesP(
-        edges,
-        rho=1,
-        theta=np.pi/180,
-        threshold=80,
-        minLineLength=warped.shape[1] // 5,
-        maxLineGap=8
-    )
+    # Normalize
+    proj_x = (proj_x - proj_x.min()) / (proj_x.max() - proj_x.min())
+    proj_y = (proj_y - proj_y.min()) / (proj_y.max() - proj_y.min())
 
-    if lines is None:
-        return None, None
+    # Invert → dark grid lines become peaks
+    proj_x = 1 - proj_x
+    proj_y = 1 - proj_y
 
-    vertical = []
-    horizontal = []
+    # Smooth signals
+    proj_x = cv2.GaussianBlur(proj_x.reshape(-1,1), (31,1), 0).flatten()
+    proj_y = cv2.GaussianBlur(proj_y.reshape(-1,1), (31,1), 0).flatten()
 
-    for (x1, y1, x2, y2) in lines[:, 0]:
-        if abs(x1 - x2) < 10:      # vertical-ish
-            vertical.append(int((x1 + x2) // 2))
-        elif abs(y1 - y2) < 10:    # horizontal-ish
-            horizontal.append(int((y1 + y2) // 2))
+    # Threshold to find potential grid line pixels
+    xs = np.where(proj_x > 0.55)[0]
+    ys = np.where(proj_y > 0.55)[0]
 
-    vertical = merge_close_lines(vertical)
-    horizontal = merge_close_lines(horizontal)
+    def cluster(vals, expected=9):
+        if len(vals) == 0:
+            return np.linspace(0, 799, expected)
+        Z = vals.reshape(-1,1).astype(np.float32)
+        _,_,centers = cv2.kmeans(
+            Z, expected, None,
+            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1.0),
+            10,
+            cv2.KMEANS_PP_CENTERS
+        )
+        return sorted(int(c[0]) for c in centers)
 
-    # Force exactly 9 boundaries (8 squares = 9 grid lines)
-    vertical = force_exact_lines(vertical, expected=9, max_val=warped.shape[1])
-    horizontal = force_exact_lines(horizontal, expected=9, max_val=warped.shape[0])
+    vertical = cluster(xs, 9)
+    horizontal = cluster(ys, 9)
 
     return vertical, horizontal
+
 
 
 def draw_grid_lines(warped, vertical, horizontal):
@@ -264,11 +303,22 @@ def extract_squares(img_path):
 
     warped = warp_board(img, corners, out_size=800)
 
+    # ---- NEW: detect real grid boundaries ----
+    vertical, horizontal = detect_grid_by_projection(warped)
+
+
+    if vertical is None or horizontal is None:
+        raise ValueError("Grid lines not detected")
+
     squares = []
-    sq = 800 // 8
+
+    # We expect 9 vertical boundary lines and 9 horizontal boundary lines
     for r in range(8):
+        y1, y2 = horizontal[r], horizontal[r + 1]
         for c in range(8):
-            crop = warped[r*sq:(r+1)*sq, c*sq:(c+1)*sq]
+            x1, x2 = vertical[c], vertical[c + 1]
+
+            crop = warped[y1:y2, x1:x2]
             squares.append(crop)
 
     return squares
